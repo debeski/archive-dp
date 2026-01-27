@@ -1,0 +1,10 @@
+name: sops
+services:
+  sops:
+    image: debeski/sops:latest
+    container_name: sops
+    tty: true
+    stdin_open: true
+    volumes:
+      - ./secrets:/secrets   # Mount local folder with files to encrypt/decrypt
+    entrypoint: ["sh"]

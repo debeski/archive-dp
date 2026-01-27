@@ -1,0 +1,243 @@
+# Project Name
+name: archive
+
+# Main Environment Variables
+x-environment: &de
+  POSTGRES_DB: "archive"
+  POSTGRES_PORT: "5432"
+  POSTGRES_HOST: "db"
+  REDIS_URL_DB: "redis://redis:6379/1"
+  CELERY_BROKER_URL: "redis://redis:6379/2"
+  CELERY_RESULT_BACKEND: "redis://redis:6379/3"
+  BACKUP_INTERVAL: "680400"
+  ALLOWED_HOSTS: "*"
+  BASE_URL: "http://localhost"
+  DEBUG_STATUS: "True"
+
+# Main Project Services
+services:
+# database server Postgres 17
+  db:
+    image: postgres:17
+    container_name: db
+    restart: always
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      <<: *de
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app_internal
+# cache server Redis 7
+  redis:
+    image: redis:7
+    container_name: cache
+    restart: always
+    command: [ "redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "500mb", "--maxmemory-policy", "allkeys-lru" ]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app_internal
+# nginx reverse proxy server
+  nginx:
+    image: debeski/nginx:local
+    container_name: proxy
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - static:/app/staticfiles:ro
+      - ./media/:/app/media:ro
+    depends_on:
+      web:
+        condition: service_healthy
+        restart: true
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - app
+      - app_internal
+# main django webapp
+  web:
+    build: .
+    image: debeski/mail_archive:stable
+    container_name: webapp
+    restart: always
+    command: >
+      bash -c ' if [ "$$DEBUG_STATUS" = "True" ]; then
+          echo "Starting in DEBUG mode with Django development server..."
+          python manage.py runserver 0.0.0.0:8000
+      else
+          echo "Starting in PRODUCTION mode with Gunicorn..."
+          gunicorn -c gunicorn.py core.wsgi:application
+      fi'
+    entrypoint: [ "/app/entrypoint.sh" ]
+    post_start:
+      - command: python manage.py migrator
+    volumes:
+      # - ./documents/:/app/documents:ro
+      # - ./core/:/app/core:ro
+      # - ./users/:/app/users:ro
+      # - ./sidebar/:/app/sidebar:ro
+      - static:/app/staticfiles:rw
+      - ./media/:/app/media:rw
+      - ./logs/:/app/logs:rw
+      - ./imports/:/app/imports:ro
+    environment:
+      <<: *de
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      ADMIN_PASS: ${ADMIN_PASS}
+    healthcheck:
+      test: [ "CMD", "python", "manage.py", "check" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app_internal
+# tasks server Celery
+  celery:
+    build: .
+    image: debeski/mail_archive:stable
+    container_name: tasks
+    restart: always
+    command: [ "python", "-m", "celery", "-A", "core", "worker", "-B", "--loglevel=info" ]
+    entrypoint: [ "/app/entrypoint.sh" ]
+    volumes:
+      # - ./documents/:/app/documents:ro
+      # - ./core/:/app/core:ro
+      # - ./users/:/app/users:ro
+      - static:/app/staticfiles:ro
+      - ./media/:/app/media:rw
+      - ./logs/:/app/logs:rw
+    environment:
+      <<: *de
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      ADMIN_PASS: ${ADMIN_PASS}
+    healthcheck:
+      test: [ "CMD", "python", "-m", "celery", "-A", "core", "inspect", "ping" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app_internal
+# web-based Postgres database manager pgAdmin 4
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    restart: unless-stopped
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:80').read()" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - app_internal
+
+# database backup service
+  db-backup:
+    image: postgres:17
+    container_name: db_backup
+    restart: always
+    command: >
+      bash -c ' while true; do
+          export PGPASSWORD=$$POSTGRES_PASSWORD
+          backup_file="/.backups/backup_$$(date +%Y-%m-%d_%H-%M-%S).pgdump"
+          echo "Starting backup: $$backup_file"
+          attempts=0
+          max_attempts=5
+          until pg_dump -Fc -h $$POSTGRES_HOST -U $$POSTGRES_USER $$POSTGRES_DB -f $$backup_file || [ $$attempts -ge $$max_attempts ]; do
+              echo "pg_dump failed, retrying..."
+              attempts=$$((attempts+1))
+              sleep 5
+          done
+          if [ $$attempts -ge $$max_attempts ]; then
+              echo "Backup failed after $$attempts attempts" >&2
+              rm -f $$backup_file
+          else
+              echo "Backup successful: $$backup_file"
+              # Keep only the 3 most recent backups
+              cd /.backups && ls -tp *.pgdump | grep -v "/$$" | tail -n +4 | xargs -I {} rm -- {}
+          fi
+          sleep $$BACKUP_INTERVAL
+      done'
+    volumes:
+      - ./.backups/:/.backups:rw
+    environment:
+      <<: *de
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: [ "CMD-SHELL", "[ -d /.backups ] || exit 1" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - app_internal
+  
+# # Portainer Service
+#   portainer:
+#     image: portainer/portainer-ce:latest
+#     container_name: portainer
+#     command: -H unix:///var/run/docker.sock --base-url /portainer
+#     restart: unless-stopped
+#     volumes:
+#       - /var/run/docker.sock:/var/run/docker.sock
+#       - portainer_data:/data
+#     networks:
+#       - app_internal
+
+# List of Mounted Volumes
+volumes:
+  postgres_data:
+  redis_data:
+  pgadmin_data:
+  portainer_data:
+  static:
+
+# List of Used Networks
+networks:
+  app:
+    driver: bridge
+  app_internal:
+    internal: True
