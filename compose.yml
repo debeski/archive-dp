@@ -89,10 +89,12 @@ services:
     post_start:
       - command: python manage.py migrator
     volumes:
-      # - ./documents/:/app/documents:ro
-      # - ./core/:/app/core:ro
-      # - ./users/:/app/users:ro
-      # - ./sidebar/:/app/sidebar:ro
+      - ./documents/migrations/:/app/documents/migrations:rw
+      - ./documents/:/app/documents:ro
+      - ./core/:/app/core:ro
+      # - ../micro-users-pkg/users/migrations/:/app/users/migrations:ro
+      # - ../micro-users-pkg/users/:/app/users:ro
+      # - ../micro-sidebar-pkg/sidebar/:/app/sidebar:ro
       - static:/app/staticfiles:rw
       - ./media/:/app/media:rw
       - ./logs/:/app/logs:rw
@@ -125,9 +127,10 @@ services:
     command: [ "python", "-m", "celery", "-A", "core", "worker", "-B", "--loglevel=info" ]
     entrypoint: [ "/app/entrypoint.sh" ]
     volumes:
-      # - ./documents/:/app/documents:ro
-      # - ./core/:/app/core:ro
-      # - ./users/:/app/users:ro
+      - ./documents/:/app/documents:ro
+      - ./core/:/app/core:ro
+      # - ../micro-users-pkg/users/:/app/users:ro
+      # - ../micro-sidebar-pkg/sidebar/:/app/sidebar:ro
       - static:/app/staticfiles:ro
       - ./media/:/app/media:rw
       - ./logs/:/app/logs:rw
